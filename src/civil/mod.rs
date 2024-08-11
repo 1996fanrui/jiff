@@ -98,7 +98,7 @@ support time zones.
 */
 
 pub use self::{
-    date::{Date, DateDifference, DateSeries, DateWith},
+    date::{Date, DateArithmetic, DateDifference, DateSeries, DateWith},
     datetime::{
         DateTime, DateTimeDifference, DateTimeRound, DateTimeSeries,
         DateTimeWith,

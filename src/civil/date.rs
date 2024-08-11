@@ -1,6 +1,9 @@
+use core::time::Duration as UnsignedDuration;
+
 use crate::{
     civil::{DateTime, Era, ISOWeekDate, Time, Weekday},
-    error::{err, Error},
+    duration::{Duration, SDuration},
+    error::{err, Error, ErrorContext},
     fmt::{
         self,
         temporal::{DEFAULT_DATETIME_PARSER, DEFAULT_DATETIME_PRINTER},
@@ -14,7 +17,7 @@ use crate::{
         rangeint::{ri16, ri8, RFrom, RInto, TryRFrom},
         t::{self, Constant, Day, Month, Sign, UnixEpochDays, Year, C},
     },
-    RoundMode, Span, SpanRound, Unit, Zoned,
+    RoundMode, SignedDuration, Span, SpanRound, Unit, Zoned,
 };
 
 /// A representation of a civil date in the Gregorian calendar.
@@ -1312,16 +1315,21 @@ impl Date {
     /// Add the given span of time to this date. If the sum would overflow the
     /// minimum or maximum date values, then an error is returned.
     ///
+    /// This operation accepts three different duration types: [`Span`],
+    /// [`SignedDuration`] or [`std::time::Duration`]. This is achieved via
+    /// `From` trait implementations for the [`DateArithmetic`] type.
+    ///
     /// # Properties
     ///
-    /// This routine is _not_ commutative because some additions may be
-    /// ambiguous. For example, adding `1 month` to the date `2024-03-31` will
-    /// produce `2024-04-30` since April has only 30 days in a month. Moreover,
-    /// subtracting `1 month` from `2024-04-30` will produce `2024-03-30`,
-    /// which is not the date we started with.
+    /// When adding a [`Span`] duration, this routine is _not_ reversible
+    /// because some additions may be ambiguous. For example, adding `1 month`
+    /// to the date `2024-03-31` will produce `2024-04-30` since April has only
+    /// 30 days in a month. Conversely, subtracting `1 month` from `2024-04-30`
+    /// will produce `2024-03-30`, which is not the date we started with.
     ///
     /// If spans of time are limited to units of days (or less), then this
-    /// routine _is_ commutative.
+    /// routine _is_ reversible. This also implies that all operations with
+    /// a [`SignedDuration`] or a [`std::time::Duration`] are reversible.
     ///
     /// # Errors
     ///
@@ -1390,8 +1398,43 @@ impl Date {
     /// assert!(d.checked_add(9000.years()).is_err());
     /// assert!(d.checked_add(-19000.years()).is_err());
     /// ```
+    ///
+    /// # Example: adding absolute durations
+    ///
+    /// This shows how to add signed and unsigned absolute durations to a
+    /// `Date`. Only whole numbers of days are considered. Since this is a
+    /// civil date unaware of time zones, days are always 24 hours.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use jiff::{civil::date, SignedDuration};
+    ///
+    /// let d = date(2024, 2, 29);
+    ///
+    /// let dur = SignedDuration::from_hours(24);
+    /// assert_eq!(d.checked_add(dur)?, date(2024, 3, 1));
+    /// let dur = SignedDuration::from_hours(24);
+    /// assert_eq!(d.checked_add(-dur)?, date(2024, 2, 28));
+    ///
+    /// // Any leftover time is truncated. That is, only
+    /// // whole days from the duration are considered.
+    /// let dur = Duration::from_secs((24 * 60 * 60) + (23 * 60 * 60));
+    /// assert_eq!(d.checked_add(dur)?, date(2024, 3, 1));
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[inline]
-    pub fn checked_add(self, span: Span) -> Result<Date, Error> {
+    pub fn checked_add<A: Into<DateArithmetic>>(
+        self,
+        duration: A,
+    ) -> Result<Date, Error> {
+        let duration: DateArithmetic = duration.into();
+        duration.checked_add(self)
+    }
+
+    #[inline]
+    fn checked_add_span(self, span: Span) -> Result<Date, Error> {
         let (month, years) =
             month_add_overflowing(self.month, span.get_months_ranged());
         let year = self
@@ -1417,6 +1460,24 @@ impl Date {
         Ok(Date::from_unix_epoch_days(days))
     }
 
+    #[inline]
+    fn checked_add_duration(
+        self,
+        duration: SignedDuration,
+    ) -> Result<Date, Error> {
+        // OK because 24!={-1,0}.
+        let days = duration.as_hours() / 24;
+        let days =
+            UnixEpochDays::try_new("days", days).with_context(|| {
+                err!(
+                    "{days} computed from duration {duration:?} overflows \
+                     Jiff's datetime limits",
+                )
+            })?;
+        let days = self.to_unix_epoch_days().try_checked_add("days", days)?;
+        Ok(Date::from_unix_epoch_days(days))
+    }
+
     /// This routine is identical to [`Date::checked_add`] with the duration
     /// negated.
     ///
@@ -1427,25 +1488,28 @@ impl Date {
     /// # Example
     ///
     /// ```
-    /// use jiff::{civil::date, ToSpan};
+    /// use std::time::Duration;
     ///
-    /// let d = date(2024, 3, 31);
-    /// assert_eq!(d.checked_sub(1.months())?, date(2024, 2, 29));
-    /// // Adding subtracting two months gives us Jan 31, not Jan 30.
-    /// let d = date(2024, 3, 31);
-    /// assert_eq!(d.checked_sub(2.months())?, date(2024, 1, 31));
-    /// // Any time in the span that does not exceed a day is ignored.
-    /// let d = date(2024, 3, 31);
-    /// assert_eq!(d.checked_sub(23.hours())?, date(2024, 3, 31));
-    /// // But if the time exceeds a day, that is accounted for!
-    /// let d = date(2024, 3, 31);
-    /// assert_eq!(d.checked_sub(28.hours())?, date(2024, 3, 30));
+    /// use jiff::{civil::date, SignedDuration, ToSpan};
+    ///
+    /// let d = date(2024, 2, 29);
+    /// assert_eq!(d.checked_sub(1.year())?, date(2023, 2, 28));
+    ///
+    /// let dur = SignedDuration::from_hours(24);
+    /// assert_eq!(d.checked_sub(dur)?, date(2024, 2, 28));
+    ///
+    /// let dur = Duration::from_secs(24 * 60 * 60);
+    /// assert_eq!(d.checked_sub(dur)?, date(2024, 2, 28));
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
-    pub fn checked_sub(self, span: Span) -> Result<Date, Error> {
-        self.checked_add(span.negate())
+    pub fn checked_sub<A: Into<DateArithmetic>>(
+        self,
+        duration: A,
+    ) -> Result<Date, Error> {
+        let duration: DateArithmetic = duration.into();
+        duration.checked_sub(self)
     }
 
     /// This routine is identical to [`Date::checked_add`], except the
@@ -1457,16 +1521,20 @@ impl Date {
     /// ```
     /// # // See: https://github.com/rust-lang/rust/pull/121364
     /// # #![allow(unknown_lints, ambiguous_negative_literals)]
-    /// use jiff::{civil::{Date, date}, ToSpan};
+    /// use jiff::{civil::{Date, date}, SignedDuration, ToSpan};
     ///
     /// let d = date(2024, 3, 31);
     /// assert_eq!(Date::MAX, d.saturating_add(9000.years()));
     /// assert_eq!(Date::MIN, d.saturating_add(-19000.years()));
+    /// assert_eq!(Date::MAX, d.saturating_add(SignedDuration::MAX));
+    /// assert_eq!(Date::MIN, d.saturating_add(SignedDuration::MIN));
+    /// assert_eq!(Date::MAX, d.saturating_add(std::time::Duration::MAX));
     /// ```
     #[inline]
-    pub fn saturating_add(self, span: Span) -> Date {
-        self.checked_add(span).unwrap_or_else(|_| {
-            if span.is_negative() {
+    pub fn saturating_add<A: Into<DateArithmetic>>(self, duration: A) -> Date {
+        let duration: DateArithmetic = duration.into();
+        self.checked_add(duration).unwrap_or_else(|_| {
+            if duration.is_negative() {
                 Date::MIN
             } else {
                 Date::MAX
@@ -1482,15 +1550,20 @@ impl Date {
     /// ```
     /// # // See: https://github.com/rust-lang/rust/pull/121364
     /// # #![allow(unknown_lints, ambiguous_negative_literals)]
-    /// use jiff::{civil::{Date, date}, ToSpan};
+    /// use jiff::{civil::{Date, date}, SignedDuration, ToSpan};
     ///
     /// let d = date(2024, 3, 31);
     /// assert_eq!(Date::MIN, d.saturating_sub(19000.years()));
     /// assert_eq!(Date::MAX, d.saturating_sub(-9000.years()));
+    /// assert_eq!(Date::MIN, d.saturating_sub(SignedDuration::MAX));
+    /// assert_eq!(Date::MAX, d.saturating_sub(SignedDuration::MIN));
+    /// assert_eq!(Date::MIN, d.saturating_sub(std::time::Duration::MAX));
     /// ```
     #[inline]
-    pub fn saturating_sub(self, span: Span) -> Date {
-        self.saturating_add(span.negate())
+    pub fn saturating_sub<A: Into<DateArithmetic>>(self, duration: A) -> Date {
+        let duration: DateArithmetic = duration.into();
+        let Ok(duration) = duration.checked_neg() else { return Date::MIN };
+        self.saturating_add(duration)
     }
 
     /// Returns a span representing the elapsed time from this date until
@@ -1685,6 +1758,47 @@ impl Date {
         } else {
             Ok(span)
         }
+    }
+
+    /// TODO
+    ///
+    /// BREADCRUMBS: Compare change in fallibility with `Date::until`.
+    /// Namely, this isn't as flexible.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use jiff::{civil::date, SignedDuration};
+    ///
+    /// let earlier = date(2006, 8, 24);
+    /// let later = date(2019, 1, 31);
+    /// assert_eq!(
+    ///     later.duration_since(earlier),
+    ///     SignedDuration::from_hours(4543 * 24),
+    /// );
+    /// ```
+    #[inline]
+    pub fn duration_until(self, other: Date) -> SignedDuration {
+        SignedDuration::date_until(self, other)
+    }
+
+    /// TODO
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use jiff::{civil::date, SignedDuration};
+    ///
+    /// let earlier = date(2006, 8, 24);
+    /// let later = date(2019, 1, 31);
+    /// assert_eq!(
+    ///     later.duration_since(earlier),
+    ///     SignedDuration::from_hours(4543 * 24),
+    /// );
+    /// ```
+    #[inline]
+    pub fn duration_since(self, other: Date) -> SignedDuration {
+        SignedDuration::date_until(other, self)
     }
 
     /// Return an iterator of periodic dates determined by the given span.
@@ -2253,6 +2367,105 @@ impl Iterator for DateSeries {
         self.step = self.step.checked_add(1)?;
         let date = self.start.checked_add(span).ok()?;
         Some(date)
+    }
+}
+
+/// Options for [`Date::checked_add`] and [`Date::checked_sub`].
+///
+/// This type provides a way to ergonomically add one of a few different
+/// duration types to a [`Date`].
+///
+/// The main way to construct values of this type is with its `From` trait
+/// implementations:
+///
+/// * `From<Span> for DateArithmetic` adds (or subtracts) the given span to the
+/// receiver date.
+/// * `From<SignedDuration> for DateArithmetic` adds (or subtracts)
+/// the given signed duration to the receiver date.
+/// * `From<std::time::Duration> for DateArithmetic` adds (or subtracts)
+/// the given unsigned duration to the receiver date.
+///
+/// # Example
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use jiff::{civil::date, SignedDuration, ToSpan};
+///
+/// let d = date(2024, 2, 29);
+/// assert_eq!(d.checked_add(1.year())?, date(2025, 2, 28));
+/// assert_eq!(d.checked_add(SignedDuration::from_hours(24))?, date(2024, 3, 1));
+/// assert_eq!(d.checked_add(Duration::from_secs(24 * 60 * 60))?, date(2024, 3, 1));
+///
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct DateArithmetic {
+    duration: Duration,
+}
+
+impl DateArithmetic {
+    #[inline]
+    fn checked_add(self, date: Date) -> Result<Date, Error> {
+        match self.duration.to_signed()? {
+            SDuration::Span(span) => date.checked_add_span(span),
+            SDuration::Absolute(sdur) => date.checked_add_duration(sdur),
+        }
+    }
+
+    #[inline]
+    fn checked_sub(self, date: Date) -> Result<Date, Error> {
+        self.checked_neg().and_then(|da| da.checked_add(date))
+    }
+
+    #[inline]
+    fn checked_neg(self) -> Result<DateArithmetic, Error> {
+        let duration = self.duration.checked_neg()?;
+        Ok(DateArithmetic { duration })
+    }
+
+    #[inline]
+    fn is_negative(&self) -> bool {
+        self.duration.is_negative()
+    }
+}
+
+impl From<Span> for DateArithmetic {
+    fn from(span: Span) -> DateArithmetic {
+        let duration = Duration::from(span);
+        DateArithmetic { duration }
+    }
+}
+
+impl From<SignedDuration> for DateArithmetic {
+    fn from(sdur: SignedDuration) -> DateArithmetic {
+        let duration = Duration::from(sdur);
+        DateArithmetic { duration }
+    }
+}
+
+impl From<UnsignedDuration> for DateArithmetic {
+    fn from(udur: UnsignedDuration) -> DateArithmetic {
+        let duration = Duration::from(udur);
+        DateArithmetic { duration }
+    }
+}
+
+impl<'a> From<&'a Span> for DateArithmetic {
+    fn from(span: &'a Span) -> DateArithmetic {
+        DateArithmetic::from(*span)
+    }
+}
+
+impl<'a> From<&'a SignedDuration> for DateArithmetic {
+    fn from(sdur: &'a SignedDuration) -> DateArithmetic {
+        DateArithmetic::from(*sdur)
+    }
+}
+
+impl<'a> From<&'a UnsignedDuration> for DateArithmetic {
+    fn from(udur: &'a UnsignedDuration) -> DateArithmetic {
+        DateArithmetic::from(*udur)
     }
 }
 

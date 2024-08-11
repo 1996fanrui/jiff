@@ -662,6 +662,7 @@ pub use crate::{
 mod logging;
 
 pub mod civil;
+mod duration;
 mod error;
 pub mod fmt;
 #[cfg(feature = "std")]
