@@ -1257,6 +1257,7 @@ fn timestamp_to_datetime_zulu(
     timestamp: Timestamp,
     offset: Offset,
 ) -> civil::DateTime {
+
     let mut second = timestamp.as_second_ranged();
     let nanosecond = timestamp.subsec_nanosecond_ranged();
     second += offset.seconds_ranged();
